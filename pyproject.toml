@@ -1,21 +1,20 @@
 [project]
 name = "maimai-timing-align"
 version = "0.1.0"
-description = "Streamlit app for maimai clip transition alignment and full video export"
+description = "Streamlit app for maimai audio alignment, preview and video re-encoding export"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "streamlit>=1.45.0",
-  "numpy>=2.2.0",
-  "opencv-python-headless>=4.11.0.86",
-  "scipy>=1.16.0",
-  "pandas>=2.3.0",
+  "httpx>=0.28.0",
+  "playwright>=1.54.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3.0",
   "ruff>=0.12.0",
+  "pyinstaller>=6.16.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,158 +1,81 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
+from urllib.request import Request, urlopen
 
-import cv2
-import pandas as pd
 import streamlit as st
 
-from .analysis import align_videos
+from maimai_timing_align.analysis import align_audio_media
+
 from .exporter import export_aligned_video
 from .media import ensure_ffmpeg_available
-from .models import AlignConfig, AlignResult
+from .models import AlignConfig
 
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+CHUNK_SIZE = 2 * 1024 * 1024
+LXNS_BASE = "https://assets2.lxns.net/maimai"
 
 def _fmt_sec(v: float) -> str:
     return f"{v:.3f}s"
 
 
-def _save_uploaded(uploaded, target_dir: Path) -> Path:
-    suffix = Path(uploaded.name).suffix or ".mp4"
-    out = target_dir / f"{uploaded.file_id}{suffix}"
-    out.write_bytes(uploaded.getbuffer())
-    return out
+def _safe_name(name: str, fallback: str) -> str:
+    out = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name.strip())
+    return (out[:80] or fallback).strip("_")
 
 
-def _collect_debug_frames(video_path: Path, debug_info, max_around: int = 20) -> list[dict]:
-    if not debug_info or debug_info.selected_index is None:
-        return []
-    if not debug_info.source_frame_indices:
-        return []
-
-    idx = int(debug_info.selected_index)
-    ts = debug_info.timestamps or []
-    scores = debug_info.score or []
-    src_frames = debug_info.source_frame_indices or []
-    if idx < 0 or idx >= len(src_frames):
-        return []
-
-    start = max(0, idx - max_around)
-    end = min(len(src_frames), idx + max_around + 1)
-    target_rows = list(range(start, end))
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return []
-
-    frames: list[dict] = []
-    try:
-        for i in target_rows:
-            src = int(src_frames[i])
-            cap.set(cv2.CAP_PROP_POS_FRAMES, src)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-
-            ok_enc, buf = cv2.imencode(".jpg", frame)
-            if not ok_enc:
-                continue
-
-            frames.append(
-                {
-                    "rel": i - idx,
-                    "sample_idx": i,
-                    "src_frame": src,
-                    "t_sec": float(ts[i]) if i < len(ts) else None,
-                    "score": float(scores[i]) if i < len(scores) else None,
-                    "selected": i == idx,
-                    "image": buf.tobytes(),
-                }
-            )
-    finally:
-        cap.release()
-
-    return frames
+def _save_uploaded(uploaded, target_path: Path) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    uploaded.seek(0)
+    with target_path.open("wb") as fw:
+        while True:
+            chunk = uploaded.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise RuntimeError("文件超过 500MB 限制")
+            fw.write(chunk)
+    uploaded.seek(0)
+    return target_path
 
 
-def _show_debug(result: AlignResult, debug_frames: dict | None = None) -> None:
-    st.subheader("检测诊断")
-
-    around_frames = st.slider("调试：显示锚点前后帧数", 2, 20, 8, 1)
-
-    def _show_anchor_window(title: str, debug_info) -> None:
-        if not debug_info or debug_info.selected_index is None:
-            return
-
-        idx = int(debug_info.selected_index)
-        ts = debug_info.timestamps
-        scores = debug_info.score
-        src_frames = debug_info.source_frame_indices
-        if not ts or not scores:
-            return
-
-        if idx < 0 or idx >= len(ts):
-            return
-
-        selected_t = float(ts[idx])
-        selected_src = None
-        if src_frames and idx < len(src_frames):
-            selected_src = int(src_frames[idx])
-
-        label = f"{title} 实际采用时间点: {selected_t:.3f}s"
-        if selected_src is not None:
-            label += f"（源帧 #{selected_src}）"
-        st.caption(label)
-
-        start = max(0, idx - around_frames)
-        end = min(len(ts), idx + around_frames + 1)
-
-        rows: list[dict[str, float | int | str]] = []
-        for i in range(start, end):
-            row: dict[str, float | int | str] = {
-                "rel": i - idx,
-                "sample_idx": i,
-                "t_sec": float(ts[i]),
-                "score": float(scores[i]),
-                "selected": "<--" if i == idx else "",
-            }
-            if src_frames and i < len(src_frames):
-                row["src_frame"] = int(src_frames[i])
-            rows.append(row)
-
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-
-        if debug_frames and title in debug_frames:
-            subset = [x for x in debug_frames[title] if abs(int(x["rel"])) <= around_frames]
-            if subset:
-                st.markdown(f"**{title} 锚点前后帧预览**")
-                cols = st.columns(5)
-                for j, item in enumerate(subset):
-                    col = cols[j % 5]
-                    caption = (
-                        f"rel={item['rel']} | src={item['src_frame']}\n"
-                        f"t={item['t_sec']:.3f}s | s={item['score']:.3f}"
-                    )
-                    if item["selected"]:
-                        caption = "[SELECTED]\n" + caption
-                    col.image(item["image"], caption=caption, width=180)
-
-    if result.debug1:
-        st.markdown("**Clip1 转场分数**")
-        df1 = pd.DataFrame({"t": result.debug1.timestamps, "score": result.debug1.score}).set_index("t")
-        st.line_chart(df1)
-        _show_anchor_window("Clip1", result.debug1)
-    if result.debug2:
-        st.markdown("**Clip2 转场分数**")
-        df2 = pd.DataFrame({"t": result.debug2.timestamps, "score": result.debug2.score}).set_index("t")
-        st.line_chart(df2)
-        _show_anchor_window("Clip2", result.debug2)
+def _download_lxns_song(song_id: str, target_path: Path) -> Path:
+    sid = (song_id or "").strip()
+    if not sid.isdigit():
+        raise RuntimeError("谱面 Song ID 必须是数字")
+    req = Request(
+        f"{LXNS_BASE}/music/{sid}.mp3",
+        headers={"User-Agent": "maimai-timing-align/0.2", "Accept": "audio/mpeg,*/*;q=0.8"},
+    )
+    total = 0
+    with urlopen(req, timeout=30) as resp, target_path.open("wb") as fw:  # noqa: S310
+        while True:
+            chunk = resp.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise RuntimeError("下载音频超过 500MB 限制")
+            fw.write(chunk)
+    return target_path
 
 
 def run_app() -> None:
     st.set_page_config(page_title="maimai timing align", layout="wide")
-    st.title("maimai-timing-align")
-    st.caption("单明显转场自动对齐（极性无关）+ 完整视频导出（Clip1画面 + 双轨混音）")
+    st.title("maimai Timing Align")
+    st.caption("基于音频内容对齐两段视频/音频，为你的手元呈现完整的听觉体验！")
+
+    if "work_dir" not in st.session_state:
+        st.session_state["work_dir"] = tempfile.mkdtemp(prefix="maimai-align-ui-")
+    work_dir = Path(st.session_state["work_dir"])
+    in_dir = work_dir / "inputs"
+    out_dir = work_dir / "outputs"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         ensure_ffmpeg_available()
@@ -160,101 +83,126 @@ def run_app() -> None:
         st.error(str(exc))
         st.stop()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        clip1 = st.file_uploader("上传 Clip1（输出画面来源）", type=["mp4", "mov", "mkv", "webm"])
-    with c2:
-        clip2 = st.file_uploader("上传 Clip2（对齐与混音来源）", type=["mp4", "mov", "mkv", "webm"])
+    st.sidebar.header("导出设置")
+    output_target_preset = st.sidebar.selectbox(
+        "导出预设",
+        options=["aggressive", "small", "balanced", "quality"],
+        format_func=lambda x: {
+            "aggressive": "极限压缩",
+            "small": "体积优先",
+            "balanced": "平衡",
+            "quality": "画质优先",
+        }[x],
+        index=1,
+    )
+    output_video_codec = st.sidebar.selectbox(
+        "编码格式",
+        options=["h264", "h265"],
+        format_func=lambda x: "H.264 (兼容优先)" if x == "h264" else "H.265 (体积更小)",
+        index=1,
+    )
+    output_width = st.sidebar.selectbox("输出宽度", options=[720, 1080, 1440], index=1)
+    output_fps = st.sidebar.selectbox("输出帧率", options=[30, 60], index=0)
 
-    st.sidebar.header("参数")
-    sample_fps = st.sidebar.slider("分析采样 FPS", 6, 30, 15)
-    resize_width = st.sidebar.slider("分析宽度", 320, 1280, 640, step=32)
-    center_crop_ratio = st.sidebar.slider("中心裁剪比例", 0.50, 1.00, 0.82, step=0.01)
-    smoothing_window = st.sidebar.slider("平滑窗口", 3, 31, 7, step=2)
-    min_peak_distance_sec = st.sidebar.slider("最小峰间隔(秒)", 0.10, 2.00, 0.35, step=0.05)
-    min_peak_z = st.sidebar.slider("最小峰值z", 1.0, 8.0, 2.8, step=0.1)
-    audio2_gain_db = st.sidebar.slider("Clip2 混音增益(dB)", -18.0, 6.0, -6.0, step=0.5)
+    st.sidebar.header("音频混合")
+    audio1_gain_db = st.sidebar.slider("A 轨(Clip1)响度(dB)", -18.0, 6.0, 0.0, step=0.5)
+    audio2_gain_db = st.sidebar.slider("B 轨(Clip2)响度(dB)", -18.0, 6.0, -6.0, step=0.5)
+    audio_reverb_wet = st.sidebar.slider("混响强度", 0.0, 0.6, 0.12, step=0.01)
 
-    with st.sidebar.expander("高级：锚点权重", expanded=False):
-        anchor_front_bias_strength = st.slider("前段偏置强度", 0.0, 8.0, 3.4, step=0.1)
-        anchor_late_penalty_from = st.slider("晚段惩罚起点(相对位置)", 0.40, 0.95, 0.65, step=0.01)
-        anchor_late_penalty = st.slider("晚段惩罚系数", 0.10, 1.00, 0.35, step=0.01)
-        anchor_prev_pair_boost = st.slider("前邻峰加权", 1.00, 2.00, 1.25, step=0.01)
-        anchor_next_pair_penalty = st.slider("后邻峰惩罚", 0.50, 1.00, 0.92, step=0.01)
-        clip2_anchor_prev_pair_boost = st.slider("Clip2 前邻峰加权", 1.00, 3.00, 1.65, step=0.01)
-        clip2_anchor_first_in_pair_penalty = st.slider("Clip2 首峰惩罚", 0.20, 1.00, 0.62, step=0.01)
+    st.sidebar.header("API 设置")
+    otoge_base_url = st.sidebar.text_input("otoge-service URL", value="http://127.0.0.1:8000")
+    otoge_developer_token = st.sidebar.text_input("Developer Token", value="", type="password")
 
-    with st.sidebar.expander("高级：整体匹配", expanded=False):
-        global_search_range_sec = st.slider("全局搜索范围(±秒)", 5.0, 60.0, 20.0, step=0.5)
-        global_scan_step_sec = st.slider("全局扫描步长(秒)", 0.005, 0.100, 0.020, step=0.005)
-        global_match_min_overlap_sec = st.slider("最小重叠时长(秒)", 8.0, 60.0, 20.0, step=1.0)
-        global_match_window_sec = st.slider("分段窗口时长(秒)", 6.0, 40.0, 18.0, step=1.0)
-        global_low_conf_global_weight = st.slider("低置信全局混合权重", 0.00, 1.00, 0.25, step=0.01)
-        global_confidence_floor = st.slider("全局置信阈值", 0.00, 1.00, 0.45, step=0.01)
-        global_refine_radius_sec = st.slider("精修半径(秒)", 0.10, 3.00, 1.00, step=0.05)
-
-    use_manual = st.sidebar.checkbox("手动锚点覆盖")
-    manual_anchor1 = None
-    manual_anchor2 = None
-    if use_manual:
-        manual_anchor1 = st.sidebar.number_input("Clip1 锚点(秒)", min_value=0.0, value=0.0, step=0.1)
-        manual_anchor2 = st.sidebar.number_input("Clip2 锚点(秒)", min_value=0.0, value=0.0, step=0.1)
+    with st.sidebar.expander("高级：音频对齐参数", expanded=False):
+        audio_sr = st.number_input("sample_rate", min_value=8000, max_value=96000, value=22050, step=50)
+        audio_hop_length = st.number_input("hop_length", min_value=64, max_value=4096, value=512, step=64)
+        audio_n_fft = st.number_input("n_fft", min_value=256, max_value=8192, value=2048, step=256)
+        audio_search_range_sec = st.slider("search_range_sec", 3.0, 60.0, 20.0, step=0.5)
+        audio_min_overlap_sec = st.slider("min_overlap_sec", 3.0, 60.0, 15.0, step=0.5)
+        audio_confidence_floor = st.slider("confidence_floor", 0.00, 1.00, 0.35, step=0.01)
+        audio_max_duration_sec = st.slider("max_duration_sec", 30.0, 900.0, 300.0, step=10.0)
+        otoge_timeout_sec = st.slider("request_timeout_sec", 5.0, 90.0, 30.0, step=1.0)
 
     config = AlignConfig(
-        sample_fps=float(sample_fps),
-        resize_width=int(resize_width),
-        center_crop_ratio=float(center_crop_ratio),
-        smoothing_window=int(smoothing_window),
-        min_peak_distance_sec=float(min_peak_distance_sec),
-        min_peak_z=float(min_peak_z),
-        anchor_front_bias_strength=float(anchor_front_bias_strength),
-        anchor_late_penalty_from=float(anchor_late_penalty_from),
-        anchor_late_penalty=float(anchor_late_penalty),
-        anchor_prev_pair_boost=float(anchor_prev_pair_boost),
-        anchor_next_pair_penalty=float(anchor_next_pair_penalty),
-        clip2_anchor_prev_pair_boost=float(clip2_anchor_prev_pair_boost),
-        clip2_anchor_first_in_pair_penalty=float(clip2_anchor_first_in_pair_penalty),
-        global_search_range_sec=float(global_search_range_sec),
-        global_scan_step_sec=float(global_scan_step_sec),
-        global_match_min_overlap_sec=float(global_match_min_overlap_sec),
-        global_match_window_sec=float(global_match_window_sec),
-        global_low_conf_global_weight=float(global_low_conf_global_weight),
-        global_confidence_floor=float(global_confidence_floor),
-        global_refine_radius_sec=float(global_refine_radius_sec),
+        otoge_base_url=str(otoge_base_url).strip(),
+        otoge_developer_token=str(otoge_developer_token).strip(),
+        otoge_timeout_sec=float(otoge_timeout_sec),
+        audio_sr=int(audio_sr),
+        audio_hop_length=int(audio_hop_length),
+        audio_n_fft=int(audio_n_fft),
+        audio_search_range_sec=float(audio_search_range_sec),
+        audio_min_overlap_sec=float(audio_min_overlap_sec),
+        audio_confidence_floor=float(audio_confidence_floor),
+        audio_max_duration_sec=float(audio_max_duration_sec),
+        audio1_gain_db=float(audio1_gain_db),
         audio2_gain_db=float(audio2_gain_db),
+        audio_reverb_wet=float(audio_reverb_wet),
+        output_video_codec=str(output_video_codec),
+        output_target_preset=str(output_target_preset),
+        output_width=int(output_width),
+        output_fps=int(output_fps),
     )
 
-    run = st.button("分析转场并导出完整视频", type="primary", disabled=not (clip1 and clip2))
+    st.subheader("输入素材")
+    left_col, right_col = st.columns(2)
 
-    if run and clip1 and clip2:
+    with left_col:
+        clip1 = st.file_uploader("Clip1（手元视频）", type=["mp4", "mov", "mkv", "webm"])
+
+    clip2_uploaded = None
+    song_id = ""
+    with right_col:
+        clip2_uploaded = st.file_uploader("Clip2（音频来源）", type=["mp4", "mov", "mkv", "webm", "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"])
+        song_id = st.text_input("Song ID（仅数字）", value="").strip()
+
+    run_align = st.button("开始对齐", type="primary", disabled=not bool(clip1))
+
+    if run_align and clip1:
         with st.spinner("处理中，请稍候..."):
             try:
-                with tempfile.TemporaryDirectory(prefix="maimai-align-") as td:
-                    tmp = Path(td)
-                    p1 = _save_uploaded(clip1, tmp)
-                    p2 = _save_uploaded(clip2, tmp)
+                p1 = _save_uploaded(
+                    clip1,
+                    in_dir / f"clip1_{_safe_name(Path(clip1.name).stem, 'clip1')}{Path(clip1.name).suffix}",
+                )
 
-                    result = align_videos(
-                        p1,
-                        p2,
-                        config,
-                        manual_anchor1=manual_anchor1 if use_manual else None,
-                        manual_anchor2=manual_anchor2 if use_manual else None,
+                if song_id and clip2_uploaded:
+                    st.warning("同时提供了 Clip2 文件和 Song ID，将优先使用上传的文件进行对齐")
+                    p2 = _save_uploaded(
+                        clip2_uploaded,
+                        in_dir
+                        / (
+                            f"clip2_{_safe_name(Path(clip2_uploaded.name).stem, 'clip2')}"
+                            f"{Path(clip2_uploaded.name).suffix}"
+                        ),
                     )
+                    clip2_name = clip2_uploaded.name
+                elif not song_id and not clip2_uploaded:
+                    raise RuntimeError("请提供 Clip2 的视频/音频文件或有效的 Song ID")
+                elif song_id and not clip2_uploaded:
+                    p2 = _download_lxns_song(song_id, in_dir / f"clip2_song_{song_id}.mp3")
+                    clip2_name = f"song_{song_id}.mp3"
+                elif clip2_uploaded and not song_id:
+                    p2 = _save_uploaded(
+                        clip2_uploaded,
+                        in_dir
+                        / (
+                            f"clip2_{_safe_name(Path(clip2_uploaded.name).stem, 'clip2')}"
+                            f"{Path(clip2_uploaded.name).suffix}"
+                        ),
+                    )
+                    clip2_name = clip2_uploaded.name
+                else:
+                    raise RuntimeError("无法确定 Clip2 的输入来源，请检查上传的文件和 Song ID")
 
-                    out_name = f"aligned_{Path(clip1.name).stem}_{Path(clip2.name).stem}.mp4"
-                    out_path = tmp / out_name
-                    export_aligned_video(p1, p2, out_path, result, config)
+                result = align_audio_media(p1, p2, config)
 
-                    data = out_path.read_bytes()
-                    result.output_path = out_path
-                    st.session_state["last_output_name"] = out_name
-                    st.session_state["last_output_data"] = data
-                    st.session_state["last_result"] = result
-                    st.session_state["last_debug_frames"] = {
-                        "Clip1": _collect_debug_frames(p1, result.debug1, max_around=20),
-                        "Clip2": _collect_debug_frames(p2, result.debug2, max_around=20),
-                    }
+                st.session_state["clip1_path"] = str(p1)
+                st.session_state["clip2_path"] = str(p2)
+                st.session_state["clip1_name"] = clip1.name
+                st.session_state["clip2_name"] = clip2_name
+                st.session_state["last_result"] = result
+                st.session_state["preview_path"] = ""
+                st.session_state["final_output_path"] = ""
 
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
@@ -263,25 +211,51 @@ def run_app() -> None:
     if result:
         st.subheader("对齐结果")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Clip1 锚点", _fmt_sec(result.clip1_anchor_sec))
-        m2.metric("Clip2 锚点", _fmt_sec(result.clip2_anchor_sec))
-        m3.metric("偏移 offset", _fmt_sec(result.offset_sec))
+        m1.metric("Clip1 起点", _fmt_sec(result.clip1_start_sec))
+        m2.metric("Clip2 起点", _fmt_sec(result.clip2_start_sec))
+        m3.metric("偏移", _fmt_sec(result.offset_sec))
         m4.metric("可导出时长", _fmt_sec(result.output_duration_sec))
-        st.progress(min(1.0, max(0.0, result.confidence)))
-        st.caption(f"置信度：{result.confidence:.3f}")
+        st.progress(min(1.0, max(0.0, float(result.confidence))))
+        st.caption(f"置信度：{result.confidence:.3f} | 方法：{result.method}")
+        if result.warnings:
+            st.warning("\n".join(result.warnings))
 
-        _show_debug(result, st.session_state.get("last_debug_frames"))
+        export_now = st.button("导出完整视频", type="primary")
+        if export_now:
+            with st.spinner("正在导出..."):
+                try:
+                    p1 = Path(st.session_state["clip1_path"])
+                    p2 = Path(st.session_state["clip2_path"])
+                    out_name = (
+                        f"aligned_{_safe_name(Path(st.session_state['clip1_name']).stem, 'clip1')}_"
+                        f"{_safe_name(Path(st.session_state['clip2_name']).stem, 'clip2')}.mp4"
+                    )
+                    out_path = out_dir / out_name
+                    export_aligned_video(
+                        clip1_path=p1,
+                        clip2_path=p2,
+                        output_path=out_path,
+                        result=result,
+                        config=config,
+                        mute_clip1=False,
+                        mute_clip2=False,
+                    )
+                    st.session_state["final_output_path"] = str(out_path)
+                except Exception as exc:  # noqa: BLE001
+                    st.exception(exc)
 
-    output_data = st.session_state.get("last_output_data")
-    output_name = st.session_state.get("last_output_name", "aligned.mp4")
-    if output_data:
-        st.subheader("下载")
-        st.download_button(
-            "下载导出视频",
-            data=output_data,
-            file_name=output_name,
-            mime="video/mp4",
-        )
+        final_output_path = st.session_state.get("final_output_path")
+        if final_output_path and Path(final_output_path).exists():
+            st.success("导出完成")
+            size_mb = os.path.getsize(final_output_path) / (1024 * 1024)
+            st.caption(f"文件大小：{size_mb:.2f} MB")
+            with Path(final_output_path).open("rb") as fr:
+                st.download_button(
+                    "下载导出视频",
+                    data=fr,
+                    file_name=Path(final_output_path).name,
+                    mime="video/mp4",
+                )
 
 
 if __name__ == "__main__":

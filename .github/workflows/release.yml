@@ -1,0 +1,121 @@
+name: build-and-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller streamlit httpx playwright
+
+      - name: Download ffmpeg (linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/bin
+          curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-*-static/ffmpeg dist/bin/ffmpeg
+          cp ffmpeg-*-static/ffprobe dist/bin/ffprobe
+          chmod +x dist/bin/ffmpeg dist/bin/ffprobe
+
+      - name: Download ffmpeg (macos)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist/bin
+          curl -L https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip -o ffmpeg.zip
+          curl -L https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip -o ffprobe.zip
+          unzip -o ffmpeg.zip -d dist/bin
+          unzip -o ffprobe.zip -d dist/bin
+          chmod +x dist/bin/ffmpeg dist/bin/ffprobe
+
+      - name: Download ffmpeg (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/bin | Out-Null
+          Invoke-WebRequest -Uri https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath . -Force
+          $base = Get-ChildItem -Directory | Where-Object { $_.Name -like 'ffmpeg-*' } | Select-Object -First 1
+          Copy-Item "$($base.FullName)/bin/ffmpeg.exe" dist/bin/ffmpeg.exe
+          Copy-Item "$($base.FullName)/bin/ffprobe.exe" dist/bin/ffprobe.exe
+
+      - name: Build executable (linux/macos)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller \
+            --name maimai-timing-align \
+            --onefile \
+            --paths src \
+            --add-data "src/maimai_timing_align:maimai_timing_align" \
+            --add-binary "dist/bin/*:bin" \
+            streamlit_app.py
+
+      - name: Build executable (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --name maimai-timing-align `
+            --onefile `
+            --paths src `
+            --add-data "src/maimai_timing_align;maimai_timing_align" `
+            --add-binary "dist/bin/*;bin" `
+            streamlit_app.py
+
+      - name: Package artifact (linux/macos)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release
+          cp dist/maimai-timing-align release/maimai-timing-align-${{ runner.os }}
+
+      - name: Package artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item dist/maimai-timing-align.exe release/maimai-timing-align-Windows.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: maimai-timing-align-${{ runner.os }}
+          path: release/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
