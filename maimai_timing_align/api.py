@@ -4,8 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-
-from .models import AlignConfig
+from models import AlignConfig
 
 
 @dataclass(slots=True)

@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller streamlit httpx playwright
+          pip install pyinstaller streamlit httpx
 
       - name: Download ffmpeg (linux)
         if: runner.os == 'Linux'
@@ -68,10 +68,9 @@ jobs:
           pyinstaller \
             --name maimai-timing-align \
             --onefile \
-            --paths src \
             --copy-metadata streamlit \
             --collect-data streamlit \
-            --add-data "src/maimai_timing_align:maimai_timing_align" \
+            --add-data "maimai_timing_align:maimai_timing_align" \
             --add-binary "dist/bin/*:bin" \
             streamlit_app.py
 
@@ -82,10 +81,9 @@ jobs:
           pyinstaller `
             --name maimai-timing-align `
             --onefile `
-            --paths src `
             --copy-metadata streamlit `
             --collect-data streamlit `
-            --add-data "src/maimai_timing_align;maimai_timing_align" `
+            --add-data "maimai_timing_align;maimai_timing_align" `
             --add-binary "dist/bin/*;bin" `
             streamlit_app.py
 

@@ -6,12 +6,11 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 import streamlit as st
+from exporter import export_aligned_video
+from media import ensure_ffmpeg_available
+from models import AlignConfig
 
 from maimai_timing_align.analysis import align_audio_media
-
-from .exporter import export_aligned_video
-from .media import ensure_ffmpeg_available
-from .models import AlignConfig
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 CHUNK_SIZE = 2 * 1024 * 1024

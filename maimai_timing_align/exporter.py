@@ -4,8 +4,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from .media import ensure_ffmpeg_available, probe_media
-from .models import AlignConfig, AlignResult
+from media import ensure_ffmpeg_available, probe_media
+from models import AlignConfig, AlignResult
 
 
 def _fmt(v: float) -> str:

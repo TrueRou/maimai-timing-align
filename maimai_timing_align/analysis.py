@@ -4,9 +4,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .api import OtogeAlignClient
-from .media import extract_audio_track, probe_media
-from .models import AlignConfig, AlignResult
+from api import OtogeAlignClient
+from media import extract_audio_track, probe_media
+from models import AlignConfig, AlignResult
 
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
 

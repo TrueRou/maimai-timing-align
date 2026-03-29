@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import os
 import sys
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
+import httpx  # noqa: F401
+import streamlit.runtime.scriptrunner.magic_funcs  # noqa: F401
+import streamlit.web.bootstrap
+
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _patch_streamlit_metadata_for_frozen() -> None:
@@ -30,7 +34,29 @@ def _patch_streamlit_metadata_for_frozen() -> None:
 
 _patch_streamlit_metadata_for_frozen()
 
-from maimai_timing_align.app import run_app  # noqa: E402
+def _resolve_app_script() -> Path:
+    candidates = [
+        ROOT / "maimai_timing_align" / "app.py",
+        ROOT / "src" / "maimai_timing_align" / "app.py",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError("未找到 maimai_timing_align/app.py")
 
 if __name__ == "__main__":
-    run_app()
+    os.chdir(os.path.dirname(__file__))
+
+    flag_options = {
+        "server.port": 8503,
+        "global.developmentMode": False,
+    }
+
+    streamlit.web.bootstrap.load_config_options(flag_options=flag_options)
+    flag_options["_is_running_with_streamlit"] = True
+    streamlit.web.bootstrap.run(
+        str(_resolve_app_script()),
+        False,
+        ['run'],
+        flag_options,
+    )
