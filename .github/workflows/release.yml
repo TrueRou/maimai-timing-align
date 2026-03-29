@@ -69,6 +69,8 @@ jobs:
             --name maimai-timing-align \
             --onefile \
             --paths src \
+            --copy-metadata streamlit \
+            --collect-data streamlit \
             --add-data "src/maimai_timing_align:maimai_timing_align" \
             --add-binary "dist/bin/*:bin" \
             streamlit_app.py
@@ -81,6 +83,8 @@ jobs:
             --name maimai-timing-align `
             --onefile `
             --paths src `
+            --copy-metadata streamlit `
+            --collect-data streamlit `
             --add-data "src/maimai_timing_align;maimai_timing_align" `
             --add-binary "dist/bin/*;bin" `
             streamlit_app.py
