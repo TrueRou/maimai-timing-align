@@ -110,8 +110,8 @@ def run_app() -> None:
     audio_reverb_wet = st.sidebar.slider("混响强度", 0.0, 0.6, 0.12, step=0.01)
 
     st.sidebar.header("API 设置")
-    otoge_base_url = st.sidebar.text_input("otoge-service URL", value="http://127.0.0.1:8000")
-    otoge_developer_token = st.sidebar.text_input("Developer Token", value="", type="password")
+    otoge_base_url = st.sidebar.text_input("otoge-service URL", value="https://api.turou.fun/otoge")
+    otoge_developer_token = st.sidebar.text_input("Developer Token", value="c4f33434df6d5e22a91283e68c9899f9", type="password")
 
     with st.sidebar.expander("高级：音频对齐参数", expanded=False):
         audio_sr = st.number_input("sample_rate", min_value=8000, max_value=96000, value=22050, step=50)
