@@ -50,6 +50,7 @@ if __name__ == "__main__":
     flag_options = {
         "server.port": 8503,
         "global.developmentMode": False,
+        "server.maxUploadSize": 1000,
     }
 
     streamlit.web.bootstrap.load_config_options(flag_options=flag_options)
