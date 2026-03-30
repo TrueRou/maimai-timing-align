@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import librosa
@@ -10,11 +12,13 @@ import numpy as np
 try:
     from .api import OtogeAlignClient
     from .media import extract_audio_track, probe_media
-    from .models import AlignConfig, AlignResult, AlignSegment
+    from .models import AlignConfig, AlignResult, AlignSegment, OsuBatchMatchResult
+    from .osu import download_osz_and_extract_first_mp3, search_osu_candidates
 except ImportError:  # pragma: no cover
     from api import OtogeAlignClient
     from media import extract_audio_track, probe_media
-    from models import AlignConfig, AlignResult, AlignSegment
+    from models import AlignConfig, AlignResult, AlignSegment, OsuBatchMatchResult
+    from osu import download_osz_and_extract_first_mp3, search_osu_candidates
 
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
 
@@ -132,6 +136,148 @@ def _weighted_similarity(
     return _clamp01(score), onset_score, chroma_score, temp_score
 
 
+def _score_candidate_pair(
+    start_a: int,
+    start_b: int,
+    features1: dict[str, np.ndarray],
+    features2: dict[str, np.ndarray],
+    window_frames: int,
+    hop_sec: float,
+    config: AlignConfig,
+) -> tuple[float, float, float, float, float, float] | None:
+    score, onset_score, chroma_score, temp_score = _weighted_similarity(
+        features1,
+        features2,
+        start_a,
+        start_b,
+        window_frames,
+        config,
+    )
+    if score < float(config.similar_similarity_floor):
+        return None
+    return (
+        score,
+        onset_score,
+        chroma_score,
+        temp_score,
+        float(start_a) * hop_sec,
+        float(start_b) * hop_sec,
+    )
+
+
+def _similar_num_workers(config: AlignConfig) -> int:
+    value = getattr(config, "similar_num_workers", 0)
+    try:
+        workers = int(value)
+    except (TypeError, ValueError):
+        workers = 0
+    return workers
+
+
+def _refine_segment_bounds(
+    feature_a: dict[str, np.ndarray],
+    feature_b: dict[str, np.ndarray],
+    start_a: int,
+    start_b: int,
+    seed_length_frames: int,
+    frames1: int,
+    frames2: int,
+    step_frames: int,
+    config: AlignConfig,
+) -> tuple[int, int, int, float, float, float, float]:
+    best_start_a = start_a
+    best_start_b = start_b
+    best_length = seed_length_frames
+    best_score, best_onset, best_chroma, best_temp = _weighted_similarity(
+        feature_a,
+        feature_b,
+        start_a,
+        start_b,
+        seed_length_frames,
+        config,
+    )
+
+    expand_floor = max(
+        float(config.similar_similarity_floor),
+        best_score - 0.06,
+    )
+
+    current_start_a = start_a
+    current_start_b = start_b
+    current_length = seed_length_frames
+
+    def _is_better(score: float, length: int, start1: int, start2: int) -> bool:
+        if score > best_score + 1e-9:
+            return True
+        if abs(score - best_score) <= 1e-9 and length > best_length:
+            return True
+        if (
+            abs(score - best_score) <= 1e-9
+            and length == best_length
+            and (start1 < best_start_a or start2 < best_start_b)
+        ):
+            return True
+        return False
+
+    while True:
+        expanded = False
+
+        if current_start_a - step_frames >= 0 and current_start_b - step_frames >= 0:
+            cand_start_a = current_start_a - step_frames
+            cand_start_b = current_start_b - step_frames
+            cand_length = current_length + step_frames
+            score, onset_score, chroma_score, temp_score = _weighted_similarity(
+                feature_a,
+                feature_b,
+                cand_start_a,
+                cand_start_b,
+                cand_length,
+                config,
+            )
+            if score >= expand_floor:
+                current_start_a = cand_start_a
+                current_start_b = cand_start_b
+                current_length = cand_length
+                expanded = True
+                if _is_better(score, cand_length, cand_start_a, cand_start_b):
+                    best_start_a = cand_start_a
+                    best_start_b = cand_start_b
+                    best_length = cand_length
+                    best_score = score
+                    best_onset = onset_score
+                    best_chroma = chroma_score
+                    best_temp = temp_score
+
+        if current_start_a + current_length + step_frames <= frames1 and current_start_b + current_length + step_frames <= frames2:
+            cand_start_a = current_start_a
+            cand_start_b = current_start_b
+            cand_length = current_length + step_frames
+            score, onset_score, chroma_score, temp_score = _weighted_similarity(
+                feature_a,
+                feature_b,
+                cand_start_a,
+                cand_start_b,
+                cand_length,
+                config,
+            )
+            if score >= expand_floor:
+                current_length = cand_length
+                expanded = True
+                if _is_better(score, cand_length, cand_start_a, cand_start_b):
+                    best_start_a = cand_start_a
+                    best_start_b = cand_start_b
+                    best_length = cand_length
+                    best_score = score
+                    best_onset = onset_score
+                    best_chroma = chroma_score
+                    best_temp = temp_score
+
+        if not expanded:
+            break
+
+    return best_start_a, best_start_b, best_length, best_score, best_onset, best_chroma, best_temp
+
+
 def _select_similar_segments(a1: Path, a2: Path, m1, m2, config: AlignConfig) -> AlignResult:
     features1, hop_sec_1, duration1 = _extract_similarity_features(a1, config)
     features2, hop_sec_2, duration2 = _extract_similarity_features(a2, config)
@@ -146,35 +292,44 @@ def _select_similar_segments(a1: Path, a2: Path, m1, m2, config: AlignConfig) ->
         raise RuntimeError("音频太短，无法进行相似段匹配")
 
     candidates: list[AlignSegment] = []
-    floor = float(config.similar_similarity_floor)
     min_gap = max(0.0, float(config.similar_min_segment_gap_sec))
     margin_before = max(0.0, float(config.similar_margin_before_sec))
     margin_after = max(0.0, float(config.similar_margin_after_sec))
     max_segments = max(1, int(config.similar_max_segments))
 
     candidate_rows: list[tuple[float, float, float, float, float, float]] = []
-    for start_a in range(0, frames1 - window_frames + 1, step_frames):
-        for start_b in range(0, frames2 - window_frames + 1, step_frames):
-            score, onset_score, chroma_score, temp_score = _weighted_similarity(
-                features1,
-                features2,
-                start_a,
-                start_b,
-                window_frames,
-                config,
-            )
-            if score < floor:
-                continue
-            candidate_rows.append(
-                (
-                    score,
-                    onset_score,
-                    chroma_score,
-                    temp_score,
-                    float(start_a) * hop_sec,
-                    float(start_b) * hop_sec,
+    tasks = [
+        (start_a, start_b)
+        for start_a in range(0, frames1 - window_frames + 1, step_frames)
+        for start_b in range(0, frames2 - window_frames + 1, step_frames)
+    ]
+    configured_workers = _similar_num_workers(config)
+    max_workers = configured_workers if configured_workers > 0 else min(32, (os.cpu_count() or 1))
+
+    if max_workers <= 1 or len(tasks) <= 1:
+        for start_a, start_b in tasks:
+            scored = _score_candidate_pair(start_a, start_b, features1, features2, window_frames, hop_sec, config)
+            if scored is not None:
+                candidate_rows.append(scored)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _score_candidate_pair,
+                    start_a,
+                    start_b,
+                    features1,
+                    features2,
+                    window_frames,
+                    hop_sec,
+                    config,
                 )
-            )
+                for start_a, start_b in tasks
+            ]
+            for future in futures:
+                scored = future.result()
+                if scored is not None:
+                    candidate_rows.append(scored)
 
     candidate_rows.sort(key=lambda item: item[0], reverse=True)
     for score, onset_score, chroma_score, temp_score, clip1_match_start, clip2_match_start in candidate_rows:
@@ -183,7 +338,31 @@ def _select_similar_segments(a1: Path, a2: Path, m1, m2, config: AlignConfig) ->
         if any(abs(existing.clip2_match_start_sec - clip2_match_start) < min_gap for existing in candidates):
             continue
 
-        base_duration = float(config.similar_match_window_sec)
+        start_a_frames = int(round(clip1_match_start / max(hop_sec, 1e-6)))
+        start_b_frames = int(round(clip2_match_start / max(hop_sec, 1e-6)))
+        (
+            refined_start_a,
+            refined_start_b,
+            refined_length_frames,
+            score,
+            onset_score,
+            chroma_score,
+            temp_score,
+        ) = _refine_segment_bounds(
+            features1,
+            features2,
+            start_a_frames,
+            start_b_frames,
+            window_frames,
+            frames1,
+            frames2,
+            step_frames,
+            config,
+        )
+
+        clip1_match_start = float(refined_start_a) * hop_sec
+        clip2_match_start = float(refined_start_b) * hop_sec
+        base_duration = float(refined_length_frames) * hop_sec
         export_start_1 = max(0.0, clip1_match_start - margin_before)
         export_start_2 = max(0.0, clip2_match_start - margin_before)
         export_duration = min(
@@ -211,7 +390,7 @@ def _select_similar_segments(a1: Path, a2: Path, m1, m2, config: AlignConfig) ->
                 onset_score=onset_score,
                 chroma_score=chroma_score,
                 tempogram_score=temp_score,
-                note="综合匹配: onset/chroma/tempogram",
+                note="综合匹配: onset/chroma/tempogram，长度自动扩展",
             )
         )
         if len(candidates) >= max_segments:
@@ -360,3 +539,53 @@ def align_audio_media(clip1_path: Path, clip2_path: Path, config: AlignConfig) -
         method=result.method,
         warnings=merged_warnings or None,
     )
+
+
+def batch_match_osu_candidates(clip1_path: Path, work_dir: Path, config: AlignConfig) -> list[OsuBatchMatchResult]:
+    candidates = search_osu_candidates(config)
+    if not candidates:
+        raise RuntimeError("未找到符合 BPM 和筛选条件的 osu 候选谱面")
+
+    out: list[OsuBatchMatchResult] = []
+    errors: list[str] = []
+    cached_audio_paths: dict[int, Path] = {}
+    cached_results: dict[int, AlignResult] = {}
+    for idx, candidate in enumerate(candidates, start=1):
+        candidate_dir = work_dir / f"osu_candidate_{idx:02d}_{candidate.beatmapset_id}"
+        try:
+            beatmapset_id = int(candidate.beatmapset_id)
+            audio_path = cached_audio_paths.get(beatmapset_id)
+            if audio_path is None:
+                audio_path = download_osz_and_extract_first_mp3(candidate, candidate_dir)
+                cached_audio_paths[beatmapset_id] = audio_path
+
+            result = cached_results.get(beatmapset_id)
+            if result is None:
+                result = align_audio_media(clip1_path, audio_path, config)
+                cached_results[beatmapset_id] = result
+
+            out.append(OsuBatchMatchResult(candidate=candidate, audio_path=audio_path, result=result))
+        except Exception as exc:
+            errors.append(f"{candidate.artist} - {candidate.title} [{candidate.version}]：{exc}")
+
+    if not out:
+        raise RuntimeError("所有 osu 候选匹配均失败：\n" + "\n".join(errors))
+
+    out.sort(key=lambda item: float(item.result.confidence), reverse=True)
+    if errors and out:
+        top = out[0]
+        merged = [*(top.result.warnings or []), *errors]
+        top.result = AlignResult(
+            clip1_anchor_sec=top.result.clip1_anchor_sec,
+            clip2_anchor_sec=top.result.clip2_anchor_sec,
+            offset_sec=top.result.offset_sec,
+            clip1_start_sec=top.result.clip1_start_sec,
+            clip2_start_sec=top.result.clip2_start_sec,
+            output_duration_sec=top.result.output_duration_sec,
+            confidence=top.result.confidence,
+            method=top.result.method,
+            warnings=merged,
+            segments=top.result.segments,
+            best_segment_index=top.result.best_segment_index,
+        )
+    return out

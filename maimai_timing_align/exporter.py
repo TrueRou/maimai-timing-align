@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shlex
 import subprocess
 from pathlib import Path
@@ -55,6 +56,66 @@ def _audio_mix_chain(config: AlignConfig, mute_clip1: bool, mute_clip2: bool) ->
         f"[amix]asplit[dry][wet];[wet]aecho=0.8:0.5:40:0.35[rev];"
         f"[dry][rev]amix=inputs=2:weights='{dry:.3f} {wet:.3f}':normalize=0,alimiter=limit=0.95[aout]"
     )
+
+
+def _segment_sort_key(segment: AlignSegment) -> tuple[float, float, int]:
+    return (float(segment.clip1_export_start_sec), float(segment.clip2_export_start_sec), int(segment.rank))
+
+
+def filter_overlay_segments(segments: list[AlignSegment], min_gap_sec: float) -> list[AlignSegment]:
+    ordered = sorted(segments, key=_segment_sort_key)
+    selected: list[AlignSegment] = []
+    last_clip1_end = -math.inf
+    last_clip2_end = -math.inf
+    gap = max(0.0, float(min_gap_sec))
+    for segment in ordered:
+        if segment.clip1_export_start_sec + 1e-6 < last_clip1_end + gap:
+            continue
+        if segment.clip2_export_start_sec + 1e-6 < last_clip2_end + gap:
+            continue
+        selected.append(segment)
+        last_clip1_end = max(last_clip1_end, float(segment.clip1_export_end_sec))
+        last_clip2_end = max(last_clip2_end, float(segment.clip2_export_end_sec))
+    return selected
+
+
+def _build_full_clip_overlay_filter(
+    clip1_duration_sec: float,
+    selected_segments: list[AlignSegment],
+    config: AlignConfig,
+    out_width: int,
+    out_fps: int,
+) -> tuple[str, list[str]]:
+    video = (
+        f"[0:v]trim=start=0:duration={_fmt(clip1_duration_sec)},setpts=PTS-STARTPTS,"
+        f"fps={int(out_fps)},scale=w={int(out_width)}:h=-2:flags=lanczos,format=yuv420p[vout]"
+    )
+
+    clip1_volume = 10 ** (float(config.audio1_gain_db) / 20.0)
+    clip2_volume = 10 ** (float(config.audio2_gain_db) / 20.0)
+    wet = float(max(0.0, min(1.0, config.audio_reverb_wet)))
+    dry = 1.0 - wet
+
+    parts = [video, f"[0:a]atrim=start=0:duration={_fmt(clip1_duration_sec)},asetpts=PTS-STARTPTS,volume={clip1_volume:.6f}[base0]"]
+    current_label = "base0"
+    for idx, segment in enumerate(selected_segments, start=1):
+        overlay_label = f"ov{idx}"
+        mixed_label = f"mix{idx}"
+        delay_ms = max(0, int(round(float(segment.clip1_export_start_sec) * 1000.0)))
+        parts.append(
+            f"[1:a]atrim=start={_fmt(segment.clip2_export_start_sec)}:duration={_fmt(segment.export_duration_sec)},"
+            f"asetpts=PTS-STARTPTS,volume={clip2_volume:.6f},adelay={delay_ms}|{delay_ms}[{overlay_label}]"
+        )
+        parts.append(
+            f"[{current_label}][{overlay_label}]amix=inputs=2:normalize=0:dropout_transition=0[{mixed_label}]"
+        )
+        current_label = mixed_label
+
+    parts.append(
+        f"[{current_label}]asplit[dry][wet];[wet]aecho=0.8:0.5:40:0.35[rev];"
+        f"[dry][rev]amix=inputs=2:weights='{dry:.3f} {wet:.3f}':normalize=0,alimiter=limit=0.95[aout]"
+    )
+    return ";".join(parts), ["-map", "[vout]", "-map", "[aout]"]
 
 
 def _build_filter(
@@ -205,6 +266,33 @@ def result_from_segment(segment: AlignSegment, method: str = "audio_similar_segm
     )
 
 
+def result_from_segment_to_end(
+    segment: AlignSegment,
+    clip1_duration_sec: float,
+    clip2_duration_sec: float,
+    method: str = "audio_similar_segments_local_to_end",
+) -> AlignResult:
+    output_duration = min(
+        max(0.0, float(clip1_duration_sec) - float(segment.clip1_export_start_sec)),
+        max(0.0, float(clip2_duration_sec) - float(segment.clip2_export_start_sec)),
+    )
+    if output_duration <= 0.5:
+        raise RuntimeError("该段落到结尾的可导出时长不足")
+
+    return AlignResult(
+        clip1_anchor_sec=float(segment.clip1_match_start_sec),
+        clip2_anchor_sec=float(segment.clip2_match_start_sec),
+        offset_sec=float(segment.clip2_match_start_sec - segment.clip1_match_start_sec),
+        clip1_start_sec=float(segment.clip1_export_start_sec),
+        clip2_start_sec=float(segment.clip2_export_start_sec),
+        output_duration_sec=float(output_duration),
+        confidence=float(segment.score),
+        method=method,
+        segments=[segment],
+        best_segment_index=0,
+    )
+
+
 def export_segment_video(
     clip1_path: Path,
     clip2_path: Path,
@@ -220,6 +308,33 @@ def export_segment_video(
         clip2_path=clip2_path,
         output_path=output_path,
         result=result_from_segment(segment),
+        config=config,
+        mute_clip1=mute_clip1,
+        mute_clip2=mute_clip2,
+    )
+
+
+def export_segment_to_end_video(
+    clip1_path: Path,
+    clip2_path: Path,
+    output_path: Path,
+    segment: AlignSegment,
+    config: AlignConfig,
+    *,
+    mute_clip1: bool = False,
+    mute_clip2: bool = False,
+) -> Path:
+    m1 = probe_media(clip1_path)
+    m2 = probe_media(clip2_path)
+    return export_aligned_video(
+        clip1_path=clip1_path,
+        clip2_path=clip2_path,
+        output_path=output_path,
+        result=result_from_segment_to_end(
+            segment,
+            clip1_duration_sec=float(m1.duration_sec),
+            clip2_duration_sec=float(m2.duration_sec),
+        ),
         config=config,
         mute_clip1=mute_clip1,
         mute_clip2=mute_clip2,
@@ -257,3 +372,72 @@ def export_multi_segment_videos(
         )
         exported.append(out_path)
     return exported
+
+
+def export_full_clip_overlay_video(
+    clip1_path: Path,
+    clip2_path: Path,
+    output_path: Path,
+    result: AlignResult,
+    config: AlignConfig,
+) -> Path:
+    if not result.segments:
+        raise RuntimeError("当前结果不包含可用于整段叠加的片段")
+
+    m1 = probe_media(clip1_path)
+    m2 = probe_media(clip2_path)
+    if not m1.has_video:
+        raise RuntimeError("Clip1 必须是视频文件")
+    if not m1.has_audio:
+        raise RuntimeError("Clip1 必须包含音轨，才能进行整段叠加导出")
+    if not m2.has_audio:
+        raise RuntimeError("Clip2 必须包含音轨，才能进行整段叠加导出")
+
+    selected_segments = filter_overlay_segments(result.segments, config.similar_min_segment_gap_sec)
+    if not selected_segments:
+        raise RuntimeError("未找到满足正序且不重复的叠加段落")
+
+    crf, preset = _preset_crf(config.output_target_preset)
+    filter_complex, map_args = _build_full_clip_overlay_filter(
+        clip1_duration_sec=float(m1.duration_sec),
+        selected_segments=selected_segments,
+        config=config,
+        out_width=int(config.output_width),
+        out_fps=int(config.output_fps),
+    )
+
+    def _base(ffmpeg_bin: str) -> list[str]:
+        return [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(clip1_path),
+            "-i",
+            str(clip2_path),
+            "-filter_complex",
+            filter_complex,
+            *map_args,
+        ]
+
+    tail = [
+        "-c:a",
+        "aac",
+        "-b:a",
+        f"{int(config.output_audio_bitrate_k)}k",
+        "-movflags",
+        "+faststart",
+        "-crf",
+        str(int(config.output_crf or crf)),
+        "-preset",
+        str(config.output_preset or preset),
+        str(output_path),
+    ]
+
+    _run_ffmpeg_with_fallback(
+        {
+            "base": _base,
+            "tail": tail,
+            "candidates": _codec_candidates(config.output_video_codec),
+        }
+    )
+    return output_path

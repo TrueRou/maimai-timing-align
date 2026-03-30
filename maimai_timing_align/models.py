@@ -30,6 +30,18 @@ class AlignConfig:
     similar_onset_weight: float = 0.4
     similar_chroma_weight: float = 0.3
     similar_tempogram_weight: float = 0.3
+    similar_num_workers: int = 0
+    similar_export_mode: Literal["segment_exports", "full_clip_overlay"] = "segment_exports"
+    osu_client_id: str = ""
+    osu_client_secret: str = ""
+    osu_query: str = ""
+    osu_artist: str = ""
+    osu_creator: str = ""
+    osu_version: str = ""
+    osu_bpm: float = 0.0
+    osu_mode: Literal["any", "osu", "taiko", "fruits", "mania"] = "any"
+    osu_category: Literal["has_leaderboard", "ranked", "loved", "qualified", "pending", "graveyard"] = "has_leaderboard"
+    osu_batch_limit: int = 5
     audio1_gain_db: float = 0.0
     audio2_gain_db: float = -6.0
     audio_reverb_wet: float = 0.12
@@ -99,3 +111,23 @@ class AlignResult:
             return None
         idx = min(max(int(self.best_segment_index), 0), len(self.segments) - 1)
         return self.segments[idx]
+
+
+@dataclass(slots=True)
+class OsuBeatmapCandidate:
+    beatmap_id: int
+    beatmapset_id: int
+    artist: str
+    title: str
+    version: str
+    creator: str
+    bpm: float
+    mode: str
+    source_url: str
+
+
+@dataclass(slots=True)
+class OsuBatchMatchResult:
+    candidate: OsuBeatmapCandidate
+    audio_path: Path
+    result: AlignResult

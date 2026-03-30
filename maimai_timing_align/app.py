@@ -9,15 +9,29 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import streamlit as st
 
 try:
-    from .exporter import export_aligned_video, export_multi_segment_videos, export_segment_video
+    from .exporter import (
+        export_aligned_video,
+        export_full_clip_overlay_video,
+        export_multi_segment_videos,
+        export_preview_video,
+        export_segment_to_end_video,
+        export_segment_video,
+    )
     from .media import ensure_ffmpeg_available
     from .models import AlignConfig
 except ImportError:  # pragma: no cover
-    from exporter import export_aligned_video, export_multi_segment_videos, export_segment_video
+    from exporter import (
+        export_aligned_video,
+        export_full_clip_overlay_video,
+        export_multi_segment_videos,
+        export_preview_video,
+        export_segment_to_end_video,
+        export_segment_video,
+    )
     from media import ensure_ffmpeg_available
     from models import AlignConfig
 
-from maimai_timing_align.analysis import align_audio_media
+from maimai_timing_align.analysis import align_audio_media, batch_match_osu_candidates
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 CHUNK_SIZE = 2 * 1024 * 1024
@@ -157,13 +171,71 @@ def run_app() -> None:
         otoge_timeout_sec = st.slider("request_timeout_sec", 5.0, 90.0, 30.0, step=1.0)
 
     with st.sidebar.expander("高级：相似段匹配参数", expanded=align_mode == "similar_segments"):
-        similar_match_window_sec = st.slider("match_window_sec", 4.0, 30.0, 12.0, step=0.5)
+        similar_match_window_sec = st.slider("seed_window_sec", 4.0, 240.0, 12.0, step=0.5)
         similar_match_step_sec = st.slider("match_step_sec", 0.5, 8.0, 2.0, step=0.5)
         similar_similarity_floor = st.slider("similarity_floor", 0.00, 1.00, 0.58, step=0.01)
         similar_max_segments = st.slider("max_segments", 1, 12, 6, step=1)
         similar_min_segment_gap_sec = st.slider("min_segment_gap_sec", 0.0, 15.0, 5.0, step=0.5)
         similar_margin_before_sec = st.slider("margin_before_sec", 0.0, 5.0, 1.5, step=0.1)
         similar_margin_after_sec = st.slider("margin_after_sec", 0.0, 5.0, 2.0, step=0.1)
+        similar_export_mode = st.radio(
+            "similar export mode",
+            options=["segment_exports", "full_clip_overlay"],
+            format_func=lambda x: "导出多个命中段落" if x == "segment_exports" else "导出 Clip1 整段并叠加命中段",
+            index=0,
+        )
+        st.caption("`seed_window_sec` 仅作为初始搜索窗口，实际命中段长度会在分析过程中自动扩展和修正。")
+        if similar_export_mode == "full_clip_overlay":
+            st.caption("整段叠加模式会仅保留时间轴正序且不重复的段落，并将它们按命中位置叠加到 Clip1 全片音频上。")
+
+    st.subheader("输入素材")
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        clip1 = st.file_uploader("Clip1（手元视频）", type=["mp4", "mov", "mkv", "webm"])
+
+    clip2_uploaded = None
+    song_id = ""
+    clip2_source = "upload"
+    osu_bpm = 0.0
+    osu_query = ""
+    osu_artist = ""
+    osu_creator = ""
+    osu_version = ""
+    osu_client_id = ""
+    osu_client_secret = ""
+    osu_mode = "any"
+    osu_category = "has_leaderboard"
+    osu_batch_limit = 5
+    with right_col:
+        clip2_source = st.radio(
+            "Clip2 来源",
+            options=["upload", "lxns_song", "osu_batch"],
+            format_func=lambda x: {
+                "upload": "上传 Clip2 文件",
+                "lxns_song": "使用 Song ID 下载",
+                "osu_batch": "从 osu 按 BPM 批量找歌",
+            }[x],
+            index=0,
+        )
+        clip2_uploaded = st.file_uploader("Clip2（音频来源）", type=["mp4", "mov", "mkv", "webm", "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"])
+        if clip2_source == "lxns_song":
+            song_id = st.text_input("Song ID（仅数字）", value="").strip()
+        elif clip2_source == "osu_batch":
+            osu_bpm = st.number_input("osu BPM", min_value=1.0, max_value=400.0, value=180.0, step=1.0)
+            osu_query = st.text_input("关键词", value="").strip()
+            osu_artist = st.text_input("艺术家筛选", value="").strip()
+            osu_creator = st.text_input("谱师筛选", value="").strip()
+            osu_version = st.text_input("难度名筛选", value="").strip()
+            osu_mode = st.selectbox("模式", options=["any", "osu", "taiko", "fruits", "mania"], index=0)
+            osu_category = st.selectbox(
+                "分类",
+                options=["has_leaderboard", "ranked", "loved", "qualified", "pending", "graveyard"],
+                index=0,
+            )
+            osu_batch_limit = st.slider("候选数量", 1, 20, 5, step=1)
+            osu_client_id = st.text_input("osu Client ID", value="")
+            osu_client_secret = st.text_input("osu Client Secret", value="", type="password")
 
     config = AlignConfig(
         otoge_base_url=str(otoge_base_url).strip(),
@@ -186,6 +258,17 @@ def run_app() -> None:
         similar_min_segment_gap_sec=float(similar_min_segment_gap_sec),
         similar_margin_before_sec=float(similar_margin_before_sec),
         similar_margin_after_sec=float(similar_margin_after_sec),
+        similar_export_mode=str(similar_export_mode), # type: ignore
+        osu_client_id=str(osu_client_id).strip(),
+        osu_client_secret=str(osu_client_secret).strip(),
+        osu_query=str(osu_query).strip(),
+        osu_artist=str(osu_artist).strip(),
+        osu_creator=str(osu_creator).strip(),
+        osu_version=str(osu_version).strip(),
+        osu_bpm=float(osu_bpm),
+        osu_mode=str(osu_mode), # type: ignore
+        osu_category=str(osu_category), # type: ignore
+        osu_batch_limit=int(osu_batch_limit),
         audio1_gain_db=float(audio1_gain_db),
         audio2_gain_db=float(audio2_gain_db),
         audio_reverb_wet=float(audio_reverb_wet),
@@ -195,29 +278,18 @@ def run_app() -> None:
         output_fps=int(output_fps),
     )
 
-    st.subheader("输入素材")
-    left_col, right_col = st.columns(2)
-
-    with left_col:
-        clip1 = st.file_uploader("Clip1（手元视频）", type=["mp4", "mov", "mkv", "webm"])
-
-    clip2_uploaded = None
-    song_id = ""
-    with right_col:
-        clip2_uploaded = st.file_uploader("Clip2（音频来源）", type=["mp4", "mov", "mkv", "webm", "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"])
-        song_id = st.text_input("Song ID（仅数字）", value="").strip()
-
     run_align = st.button("开始对齐", type="primary", disabled=not bool(clip1))
 
     if run_align and clip1:
         with st.spinner("处理中，请稍候..."):
             try:
+                result = None
                 p1 = _save_uploaded(
                     clip1,
                     in_dir / f"clip1_{_safe_name(Path(clip1.name).stem, 'clip1')}{Path(clip1.name).suffix}",
                 )
 
-                if song_id and clip2_uploaded:
+                if clip2_source == "upload" and song_id and clip2_uploaded:
                     st.warning("同时提供了 Clip2 文件和 Song ID，将优先使用上传的文件进行对齐")
                     p2 = _save_uploaded(
                         clip2_uploaded,
@@ -228,12 +300,12 @@ def run_app() -> None:
                         ),
                     )
                     clip2_name = clip2_uploaded.name
-                elif not song_id and not clip2_uploaded:
+                elif clip2_source == "lxns_song" and not song_id and not clip2_uploaded:
                     raise RuntimeError("请提供 Clip2 的视频/音频文件或有效的 Song ID")
-                elif song_id and not clip2_uploaded:
+                elif clip2_source == "lxns_song" and song_id and not clip2_uploaded:
                     p2 = _download_lxns_song(song_id, in_dir / f"clip2_song_{song_id}.mp3")
                     clip2_name = f"song_{song_id}.mp3"
-                elif clip2_uploaded and not song_id:
+                elif clip2_source == "upload" and clip2_uploaded:
                     p2 = _save_uploaded(
                         clip2_uploaded,
                         in_dir
@@ -243,10 +315,18 @@ def run_app() -> None:
                         ),
                     )
                     clip2_name = clip2_uploaded.name
+                elif clip2_source == "osu_batch":
+                    batch_results = batch_match_osu_candidates(p1, in_dir / "osu_batch", config)
+                    best = batch_results[0]
+                    p2 = best.audio_path
+                    clip2_name = f"{best.candidate.artist} - {best.candidate.title} [{best.candidate.version}]"
+                    st.session_state["osu_batch_results"] = batch_results
+                    result = best.result
                 else:
                     raise RuntimeError("无法确定 Clip2 的输入来源，请检查上传的文件和 Song ID")
 
-                result = align_audio_media(p1, p2, config)
+                if clip2_source != "osu_batch":
+                    result = align_audio_media(p1, p2, config)
 
                 st.session_state["clip1_path"] = str(p1)
                 st.session_state["clip2_path"] = str(p2)
@@ -257,12 +337,152 @@ def run_app() -> None:
                 st.session_state["final_output_path"] = ""
                 st.session_state["segment_output_paths"] = []
                 st.session_state["segment_zip_path"] = ""
+                if clip2_source != "osu_batch":
+                    st.session_state["osu_batch_results"] = []
 
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
 
     result = st.session_state.get("last_result")
     if result:
+        batch_results = st.session_state.get("osu_batch_results")
+        if batch_results:
+            st.subheader("osu 批量匹配结果")
+            for idx, item in enumerate(batch_results, start=1):
+                with st.container(border=True):
+                    badge = "⭐ 最佳歌曲" if idx == 1 else f"候选 #{idx}"
+                    st.markdown(f"**{badge}**")
+                    st.caption(
+                        f"{item.candidate.artist} - {item.candidate.title} [{item.candidate.version}] | "
+                        f"Mapper: {item.candidate.creator} | BPM: {item.candidate.bpm:.0f} | 分数: {item.result.confidence:.3f}"
+                    )
+                    if item.result.segments:
+                        with st.expander(f"查看 {badge} 的候选段落", expanded=idx == 1):
+                            for segment in item.result.segments:
+                                st.markdown(
+                                    f"- {'⭐ ' if segment.is_best else ''}段落 #{segment.rank} | "
+                                    f"Clip1 {_fmt_range(segment.clip1_match_start_sec, segment.match_duration_sec)} | "
+                                    f"Clip2 {_fmt_range(segment.clip2_match_start_sec, segment.match_duration_sec)} | "
+                                    f"综合分数 {segment.score:.3f}"
+                                )
+                                st.caption(
+                                    f"导出范围：Clip1 {_fmt_range(segment.clip1_export_start_sec, segment.export_duration_sec)} | "
+                                    f"Clip2 {_fmt_range(segment.clip2_export_start_sec, segment.export_duration_sec)}"
+                                )
+                                preview_now = st.button(
+                                    f"预览 {badge} 段落 #{segment.rank}",
+                                    key=f"preview_batch_{idx}_{segment.segment_id}",
+                                )
+                                if preview_now:
+                                    with st.spinner(f"正在生成 {badge} 段落 #{segment.rank} 预览..."):
+                                        try:
+                                            p1 = Path(st.session_state["clip1_path"])
+                                            p2 = item.audio_path
+                                            preview_name = (
+                                                f"preview_{idx:02d}_{_safe_name(item.candidate.artist, 'artist')}_"
+                                                f"{_safe_name(item.candidate.title, 'title')}_{segment.rank:02d}.mp4"
+                                            )
+                                            preview_path = out_dir / preview_name
+                                            export_preview_video(
+                                                clip1_path=p1,
+                                                clip2_path=p2,
+                                                output_path=preview_path,
+                                                result=type(item.result)(
+                                                    clip1_anchor_sec=item.result.clip1_anchor_sec,
+                                                    clip2_anchor_sec=item.result.clip2_anchor_sec,
+                                                    offset_sec=item.result.offset_sec,
+                                                    clip1_start_sec=segment.clip1_export_start_sec,
+                                                    clip2_start_sec=segment.clip2_export_start_sec,
+                                                    output_duration_sec=segment.export_duration_sec,
+                                                    confidence=segment.score,
+                                                    method=item.result.method,
+                                                    warnings=item.result.warnings,
+                                                    segments=[segment],
+                                                    best_segment_index=0,
+                                                ),
+                                                config=config,
+                                                mute_clip1=False,
+                                                mute_clip2=False,
+                                            )
+                                            with preview_path.open("rb") as fr:
+                                                st.download_button(
+                                                    f"下载预览 {badge} 段落 #{segment.rank}",
+                                                    data=fr,
+                                                    file_name=preview_path.name,
+                                                    mime="video/mp4",
+                                                    key=f"download_preview_batch_{idx}_{segment.segment_id}",
+                                                )
+                                        except Exception as exc:  # noqa: BLE001
+                                            st.exception(exc)
+
+                                export_segment_batch_now = st.button(
+                                    f"导出 {badge} 段落 #{segment.rank}",
+                                    key=f"export_batch_segment_{idx}_{segment.segment_id}",
+                                )
+                                if export_segment_batch_now:
+                                    with st.spinner(f"正在导出 {badge} 段落 #{segment.rank}..."):
+                                        try:
+                                            p1 = Path(st.session_state["clip1_path"])
+                                            p2 = item.audio_path
+                                            out_name = (
+                                                f"aligned_{idx:02d}_{_safe_name(item.candidate.artist, 'artist')}_"
+                                                f"{_safe_name(item.candidate.title, 'title')}_{segment.rank:02d}.mp4"
+                                            )
+                                            out_path = out_dir / out_name
+                                            export_segment_video(
+                                                clip1_path=p1,
+                                                clip2_path=p2,
+                                                output_path=out_path,
+                                                segment=segment,
+                                                config=config,
+                                                mute_clip1=False,
+                                                mute_clip2=False,
+                                            )
+                                            with out_path.open("rb") as fr:
+                                                st.download_button(
+                                                    f"下载 {badge} 段落 #{segment.rank}",
+                                                    data=fr,
+                                                    file_name=out_path.name,
+                                                    mime="video/mp4",
+                                                    key=f"download_batch_segment_{idx}_{segment.segment_id}",
+                                                )
+                                        except Exception as exc:  # noqa: BLE001
+                                            st.exception(exc)
+
+                                export_to_end_batch_now = st.button(
+                                    f"从 {badge} 段落 #{segment.rank} 导出到结尾",
+                                    key=f"export_batch_to_end_{idx}_{segment.segment_id}",
+                                )
+                                if export_to_end_batch_now:
+                                    with st.spinner(f"正在导出 {badge} 段落 #{segment.rank} 到结尾..."):
+                                        try:
+                                            p1 = Path(st.session_state["clip1_path"])
+                                            p2 = item.audio_path
+                                            out_name = (
+                                                f"aligned_{idx:02d}_{_safe_name(item.candidate.artist, 'artist')}_"
+                                                f"{_safe_name(item.candidate.title, 'title')}_{segment.rank:02d}_to_end.mp4"
+                                            )
+                                            out_path = out_dir / out_name
+                                            export_segment_to_end_video(
+                                                clip1_path=p1,
+                                                clip2_path=p2,
+                                                output_path=out_path,
+                                                segment=segment,
+                                                config=config,
+                                                mute_clip1=False,
+                                                mute_clip2=False,
+                                            )
+                                            with out_path.open("rb") as fr:
+                                                st.download_button(
+                                                    f"下载 {badge} 段落 #{segment.rank} 到结尾",
+                                                    data=fr,
+                                                    file_name=out_path.name,
+                                                    mime="video/mp4",
+                                                    key=f"download_batch_to_end_{idx}_{segment.segment_id}",
+                                                )
+                                        except Exception as exc:  # noqa: BLE001
+                                            st.exception(exc)
+
         st.subheader("对齐结果")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Clip1 起点", _fmt_sec(result.clip1_start_sec))
@@ -337,6 +557,44 @@ def run_app() -> None:
                             except Exception as exc:  # noqa: BLE001
                                 st.exception(exc)
 
+                    export_to_end_now = st.button(
+                        f"从该段导出到结尾 #{segment.rank}",
+                        key=f"export_segment_to_end_{segment.segment_id}",
+                    )
+                    if export_to_end_now:
+                        with st.spinner(f"正在导出段落 #{segment.rank} 到结尾..."):
+                            try:
+                                p1 = Path(st.session_state["clip1_path"])
+                                p2 = Path(st.session_state["clip2_path"])
+                                base_name = (
+                                    f"aligned_{_safe_name(Path(st.session_state['clip1_name']).stem, 'clip1')}_"
+                                    f"{_safe_name(Path(st.session_state['clip2_name']).stem, 'clip2')}"
+                                )
+                                out_path = out_dir / (
+                                    f"{base_name}_segment_{segment.rank:02d}_to_end"
+                                    f"{'_best' if segment.is_best else ''}.mp4"
+                                )
+                                export_segment_to_end_video(
+                                    clip1_path=p1,
+                                    clip2_path=p2,
+                                    output_path=out_path,
+                                    segment=segment,
+                                    config=config,
+                                    mute_clip1=False,
+                                    mute_clip2=False,
+                                )
+                                st.success(f"段落 #{segment.rank} 到结尾导出完成")
+                                with out_path.open("rb") as fr:
+                                    st.download_button(
+                                        f"下载段落 #{segment.rank} 到结尾",
+                                        data=fr,
+                                        file_name=out_path.name,
+                                        mime="video/mp4",
+                                        key=f"download_segment_to_end_{segment.segment_id}",
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                st.exception(exc)
+
         export_now = st.button("导出完整视频", type="primary")
         if export_now:
             with st.spinner("正在导出..."):
@@ -348,20 +606,29 @@ def run_app() -> None:
                         f"{_safe_name(Path(st.session_state['clip2_name']).stem, 'clip2')}.mp4"
                     )
                     out_path = out_dir / out_name
-                    export_aligned_video(
-                        clip1_path=p1,
-                        clip2_path=p2,
-                        output_path=out_path,
-                        result=result,
-                        config=config,
-                        mute_clip1=False,
-                        mute_clip2=False,
-                    )
+                    if result.segments and config.align_mode == "similar_segments" and config.similar_export_mode == "full_clip_overlay":
+                        export_full_clip_overlay_video(
+                            clip1_path=p1,
+                            clip2_path=p2,
+                            output_path=out_path,
+                            result=result,
+                            config=config,
+                        )
+                    else:
+                        export_aligned_video(
+                            clip1_path=p1,
+                            clip2_path=p2,
+                            output_path=out_path,
+                            result=result,
+                            config=config,
+                            mute_clip1=False,
+                            mute_clip2=False,
+                        )
                     st.session_state["final_output_path"] = str(out_path)
                 except Exception as exc:  # noqa: BLE001
                     st.exception(exc)
 
-        if result.segments:
+        if result.segments and config.similar_export_mode == "segment_exports":
             export_all_segments = st.button("批量导出所有命中段落")
             if export_all_segments:
                 with st.spinner("正在批量导出段落..."):
