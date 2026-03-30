@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from models import AlignConfig
+
+try:
+    from .models import AlignConfig
+except ImportError:  # pragma: no cover
+    from models import AlignConfig
 
 
 @dataclass(slots=True)

@@ -4,11 +4,18 @@ import os
 import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import streamlit as st
-from exporter import export_aligned_video
-from media import ensure_ffmpeg_available
-from models import AlignConfig
+
+try:
+    from .exporter import export_aligned_video, export_multi_segment_videos, export_segment_video
+    from .media import ensure_ffmpeg_available
+    from .models import AlignConfig
+except ImportError:  # pragma: no cover
+    from exporter import export_aligned_video, export_multi_segment_videos, export_segment_video
+    from media import ensure_ffmpeg_available
+    from models import AlignConfig
 
 from maimai_timing_align.analysis import align_audio_media
 
@@ -18,6 +25,11 @@ LXNS_BASE = "https://assets2.lxns.net/maimai"
 
 def _fmt_sec(v: float) -> str:
     return f"{v:.3f}s"
+
+
+def _fmt_range(start: float, duration: float) -> str:
+    end = start + duration
+    return f"{start:.3f}s → {end:.3f}s"
 
 
 def _safe_name(name: str, fallback: str) -> str:
@@ -108,9 +120,31 @@ def run_app() -> None:
     audio2_gain_db = st.sidebar.slider("B 轨(Clip2)响度(dB)", -18.0, 6.0, -6.0, step=0.5)
     audio_reverb_wet = st.sidebar.slider("混响强度", 0.0, 0.6, 0.12, step=0.01)
 
+    st.sidebar.header("对齐引擎")
+    align_mode = st.sidebar.radio(
+        "对齐模式",
+        options=["standard", "similar_segments"],
+        format_func=lambda x: "普通音频对齐" if x == "standard" else "相似段匹配对齐",
+        index=0,
+    )
+    align_backend = st.sidebar.radio(
+        "对齐方式",
+        options=["remote", "local"],
+        format_func=lambda x: "外部 API" if x == "remote" else "内置 audalign",
+        index=1 if align_mode == "similar_segments" else 0,
+        disabled=align_mode == "similar_segments",
+    )
+
     st.sidebar.header("API 设置")
     otoge_base_url = st.sidebar.text_input("otoge-service URL", value="https://api.turou.fun/otoge")
-    otoge_developer_token = st.sidebar.text_input("Developer Token", value="c4f33434df6d5e22a91283e68c9899f9", type="password")
+    otoge_developer_token = st.sidebar.text_input(
+        "Developer Token",
+        value="c4f33434df6d5e22a91283e68c9899f9",
+        type="password",
+        disabled=align_backend != "remote",
+    )
+    if align_backend == "local":
+        st.sidebar.caption("当前使用内置 audalign，本次不会访问外部 API。")
 
     with st.sidebar.expander("高级：音频对齐参数", expanded=False):
         audio_sr = st.number_input("sample_rate", min_value=8000, max_value=96000, value=22050, step=50)
@@ -122,10 +156,22 @@ def run_app() -> None:
         audio_max_duration_sec = st.slider("max_duration_sec", 30.0, 900.0, 300.0, step=10.0)
         otoge_timeout_sec = st.slider("request_timeout_sec", 5.0, 90.0, 30.0, step=1.0)
 
+    with st.sidebar.expander("高级：相似段匹配参数", expanded=align_mode == "similar_segments"):
+        similar_match_window_sec = st.slider("match_window_sec", 4.0, 30.0, 12.0, step=0.5)
+        similar_match_step_sec = st.slider("match_step_sec", 0.5, 8.0, 2.0, step=0.5)
+        similar_similarity_floor = st.slider("similarity_floor", 0.00, 1.00, 0.58, step=0.01)
+        similar_max_segments = st.slider("max_segments", 1, 12, 6, step=1)
+        similar_min_segment_gap_sec = st.slider("min_segment_gap_sec", 0.0, 15.0, 5.0, step=0.5)
+        similar_margin_before_sec = st.slider("margin_before_sec", 0.0, 5.0, 1.5, step=0.1)
+        similar_margin_after_sec = st.slider("margin_after_sec", 0.0, 5.0, 2.0, step=0.1)
+
     config = AlignConfig(
         otoge_base_url=str(otoge_base_url).strip(),
         otoge_developer_token=str(otoge_developer_token).strip(),
         otoge_timeout_sec=float(otoge_timeout_sec),
+        align_mode=str(align_mode), # type: ignore
+        align_backend=str(align_backend), # type: ignore
+        align_fallback_to_local=True,
         audio_sr=int(audio_sr),
         audio_hop_length=int(audio_hop_length),
         audio_n_fft=int(audio_n_fft),
@@ -133,6 +179,13 @@ def run_app() -> None:
         audio_min_overlap_sec=float(audio_min_overlap_sec),
         audio_confidence_floor=float(audio_confidence_floor),
         audio_max_duration_sec=float(audio_max_duration_sec),
+        similar_match_window_sec=float(similar_match_window_sec),
+        similar_match_step_sec=float(similar_match_step_sec),
+        similar_similarity_floor=float(similar_similarity_floor),
+        similar_max_segments=int(similar_max_segments),
+        similar_min_segment_gap_sec=float(similar_min_segment_gap_sec),
+        similar_margin_before_sec=float(similar_margin_before_sec),
+        similar_margin_after_sec=float(similar_margin_after_sec),
         audio1_gain_db=float(audio1_gain_db),
         audio2_gain_db=float(audio2_gain_db),
         audio_reverb_wet=float(audio_reverb_wet),
@@ -202,6 +255,8 @@ def run_app() -> None:
                 st.session_state["last_result"] = result
                 st.session_state["preview_path"] = ""
                 st.session_state["final_output_path"] = ""
+                st.session_state["segment_output_paths"] = []
+                st.session_state["segment_zip_path"] = ""
 
             except Exception as exc:  # noqa: BLE001
                 st.exception(exc)
@@ -218,6 +273,69 @@ def run_app() -> None:
         st.caption(f"置信度：{result.confidence:.3f} | 方法：{result.method}")
         if result.warnings:
             st.warning("\n".join(result.warnings))
+
+        if result.segments:
+            best_segment = result.best_segment
+            if best_segment is not None:
+                st.info(
+                    "最佳段落："
+                    f"#{best_segment.rank} | Clip1 {_fmt_range(best_segment.clip1_match_start_sec, best_segment.match_duration_sec)} | "
+                    f"Clip2 {_fmt_range(best_segment.clip2_match_start_sec, best_segment.match_duration_sec)}"
+                )
+
+            st.markdown("### 命中段落")
+            for segment in result.segments:
+                with st.container(border=True):
+                    tag = "⭐ 最佳段落" if segment.is_best else f"候选段 #{segment.rank}"
+                    st.markdown(f"**{tag}**")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Clip1 命中区间", _fmt_range(segment.clip1_match_start_sec, segment.match_duration_sec))
+                    c2.metric("Clip2 命中区间", _fmt_range(segment.clip2_match_start_sec, segment.match_duration_sec))
+                    c3.metric("导出时长", _fmt_sec(segment.export_duration_sec))
+                    st.caption(
+                        f"综合分数 {segment.score:.3f} | onset {segment.onset_score:.3f} | "
+                        f"chroma {segment.chroma_score:.3f} | tempogram {segment.tempogram_score:.3f}"
+                    )
+                    st.caption(
+                        "导出范围："
+                        f"Clip1 {_fmt_range(segment.clip1_export_start_sec, segment.export_duration_sec)} | "
+                        f"Clip2 {_fmt_range(segment.clip2_export_start_sec, segment.export_duration_sec)}"
+                    )
+
+                    export_segment_now = st.button(
+                        f"导出该段 #{segment.rank}",
+                        key=f"export_segment_{segment.segment_id}",
+                    )
+                    if export_segment_now:
+                        with st.spinner(f"正在导出段落 #{segment.rank}..."):
+                            try:
+                                p1 = Path(st.session_state["clip1_path"])
+                                p2 = Path(st.session_state["clip2_path"])
+                                base_name = (
+                                    f"aligned_{_safe_name(Path(st.session_state['clip1_name']).stem, 'clip1')}_"
+                                    f"{_safe_name(Path(st.session_state['clip2_name']).stem, 'clip2')}"
+                                )
+                                out_path = out_dir / f"{base_name}_segment_{segment.rank:02d}{'_best' if segment.is_best else ''}.mp4"
+                                export_segment_video(
+                                    clip1_path=p1,
+                                    clip2_path=p2,
+                                    output_path=out_path,
+                                    segment=segment,
+                                    config=config,
+                                    mute_clip1=False,
+                                    mute_clip2=False,
+                                )
+                                st.success(f"段落 #{segment.rank} 导出完成")
+                                with out_path.open("rb") as fr:
+                                    st.download_button(
+                                        f"下载段落 #{segment.rank}",
+                                        data=fr,
+                                        file_name=out_path.name,
+                                        mime="video/mp4",
+                                        key=f"download_segment_{segment.segment_id}",
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                st.exception(exc)
 
         export_now = st.button("导出完整视频", type="primary")
         if export_now:
@@ -243,6 +361,37 @@ def run_app() -> None:
                 except Exception as exc:  # noqa: BLE001
                     st.exception(exc)
 
+        if result.segments:
+            export_all_segments = st.button("批量导出所有命中段落")
+            if export_all_segments:
+                with st.spinner("正在批量导出段落..."):
+                    try:
+                        p1 = Path(st.session_state["clip1_path"])
+                        p2 = Path(st.session_state["clip2_path"])
+                        base_name = (
+                            f"aligned_{_safe_name(Path(st.session_state['clip1_name']).stem, 'clip1')}_"
+                            f"{_safe_name(Path(st.session_state['clip2_name']).stem, 'clip2')}"
+                        )
+                        exported = export_multi_segment_videos(
+                            clip1_path=p1,
+                            clip2_path=p2,
+                            output_dir=out_dir,
+                            result=result,
+                            config=config,
+                            base_name=base_name,
+                            mute_clip1=False,
+                            mute_clip2=False,
+                        )
+                        zip_path = out_dir / f"{base_name}_segments.zip"
+                        with ZipFile(zip_path, "w", compression=ZIP_DEFLATED) as zf:
+                            for path in exported:
+                                zf.write(path, arcname=path.name)
+                        st.session_state["segment_output_paths"] = [str(path) for path in exported]
+                        st.session_state["segment_zip_path"] = str(zip_path)
+                        st.success(f"已导出 {len(exported)} 个段落")
+                    except Exception as exc:  # noqa: BLE001
+                        st.exception(exc)
+
         final_output_path = st.session_state.get("final_output_path")
         if final_output_path and Path(final_output_path).exists():
             st.success("导出完成")
@@ -254,6 +403,16 @@ def run_app() -> None:
                     data=fr,
                     file_name=Path(final_output_path).name,
                     mime="video/mp4",
+                )
+
+        segment_zip_path = st.session_state.get("segment_zip_path")
+        if segment_zip_path and Path(segment_zip_path).exists():
+            with Path(segment_zip_path).open("rb") as fr:
+                st.download_button(
+                    "下载全部命中段落(zip)",
+                    data=fr,
+                    file_name=Path(segment_zip_path).name,
+                    mime="application/zip",
                 )
 
 

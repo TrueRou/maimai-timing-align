@@ -4,8 +4,12 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from media import ensure_ffmpeg_available, probe_media
-from models import AlignConfig, AlignResult
+try:
+    from .media import ensure_ffmpeg_available, probe_media
+    from .models import AlignConfig, AlignResult, AlignSegment
+except ImportError:  # pragma: no cover
+    from media import ensure_ffmpeg_available, probe_media
+    from models import AlignConfig, AlignResult, AlignSegment
 
 
 def _fmt(v: float) -> str:
@@ -184,3 +188,72 @@ def export_preview_video(
         mute_clip2=mute_clip2,
         preview_duration_sec=config.preview_duration_sec,
     )
+
+
+def result_from_segment(segment: AlignSegment, method: str = "audio_similar_segments_local") -> AlignResult:
+    return AlignResult(
+        clip1_anchor_sec=float(segment.clip1_match_start_sec),
+        clip2_anchor_sec=float(segment.clip2_match_start_sec),
+        offset_sec=float(segment.clip2_match_start_sec - segment.clip1_match_start_sec),
+        clip1_start_sec=float(segment.clip1_export_start_sec),
+        clip2_start_sec=float(segment.clip2_export_start_sec),
+        output_duration_sec=float(segment.export_duration_sec),
+        confidence=float(segment.score),
+        method=method,
+        segments=[segment],
+        best_segment_index=0,
+    )
+
+
+def export_segment_video(
+    clip1_path: Path,
+    clip2_path: Path,
+    output_path: Path,
+    segment: AlignSegment,
+    config: AlignConfig,
+    *,
+    mute_clip1: bool = False,
+    mute_clip2: bool = False,
+) -> Path:
+    return export_aligned_video(
+        clip1_path=clip1_path,
+        clip2_path=clip2_path,
+        output_path=output_path,
+        result=result_from_segment(segment),
+        config=config,
+        mute_clip1=mute_clip1,
+        mute_clip2=mute_clip2,
+    )
+
+
+def export_multi_segment_videos(
+    clip1_path: Path,
+    clip2_path: Path,
+    output_dir: Path,
+    result: AlignResult,
+    config: AlignConfig,
+    *,
+    base_name: str,
+    mute_clip1: bool = False,
+    mute_clip2: bool = False,
+) -> list[Path]:
+    if not result.segments:
+        raise RuntimeError("当前结果不包含可导出的片段")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exported: list[Path] = []
+    for segment in result.segments:
+        best_tag = "_best" if segment.is_best else ""
+        file_name = f"{base_name}_segment_{segment.rank:02d}{best_tag}.mp4"
+        out_path = output_dir / file_name
+        export_segment_video(
+            clip1_path=clip1_path,
+            clip2_path=clip2_path,
+            output_path=out_path,
+            segment=segment,
+            config=config,
+            mute_clip1=mute_clip1,
+            mute_clip2=mute_clip2,
+        )
+        exported.append(out_path)
+    return exported
